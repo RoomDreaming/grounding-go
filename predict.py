@@ -1,100 +1,226 @@
 import os
-import sys
-import subprocess
-import torch
-
-#install GroundingDINO and segment_anything
-os.environ['CUDA_HOME'] = '/usr/local/cuda-11.7'
-os.environ['AM_I_DOCKER'] = 'true'
-os.environ['BUILD_WITH_CUDA'] = 'true'
-
-env_vars = os.environ.copy()
-HOME = os.getcwd()
-sys.path.insert(0, "weights")
-sys.path.insert(0, "weights/GroundingDINO")
-sys.path.insert(0, "weights/segment-anything")
-os.chdir("/src/weights/GroundingDINO")
-subprocess.call([sys.executable, '-m', 'pip', 'install', '-e', '.'], env=env_vars)
-os.chdir("/src/weights/segment-anything")
-subprocess.call([sys.executable, '-m', 'pip', 'install', '-e', '.'], env=env_vars)
-os.chdir(HOME)
-
-from cog import BasePredictor, Input, Path, BaseModel
-from typing import Iterator
+import cv2
 import json
-from groundingdino.util.slconfig import SLConfig
-from groundingdino.models import build_model
-from groundingdino.util.utils import clean_state_dict
-from segment_anything import build_sam, SamPredictor
-from grounded_sam import run_grounding_sam
+import torch
+import numpy as np
+from PIL import Image
+from pathlib import Path
+from typing import Iterator
 import uuid
-from hf_path_exports import cache_config_file, cache_file
+
+from cog import BasePredictor, Input, Path as CogPath
+
+# Grounding DINO
+import groundingdino.datasets.transforms as T
+from groundingdino.models import build_model
+from groundingdino.util.slconfig import SLConfig
+from groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
+
+# Segment Anything
+from segment_anything import sam_model_registry, SamPredictor
 
 class Predictor(BasePredictor):
-    def setup(self):
+    def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
-        print("Loading pipelines...x")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Paths defined in cog.yaml
+        self.grounding_dino_config_path = "weights/GroundingDINO_SwinT_OGC.py"
+        self.grounding_dino_checkpoint_path = "weights/groundingdino_swint_ogc.pth"
+        self.sam_checkpoint_path = "weights/sam_vit_h_4b8939.pth"
+        
+        print("Loading GroundingDINO...")
+        self.grounding_dino_model = self.load_grounding_dino(
+            self.grounding_dino_config_path, 
+            self.grounding_dino_checkpoint_path, 
+            self.device
+        )
+        
+        print("Loading SAM...")
+        sam = sam_model_registry["vit_h"](checkpoint=self.sam_checkpoint_path)
+        sam.to(device=self.device)
+        self.sam_predictor = SamPredictor(sam)
+        
+    def load_grounding_dino(self, model_config_path, model_checkpoint_path, device):
+        args = SLConfig.fromfile(model_config_path)
+        args.device = device
+        model = build_model(args)
+        checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
+        load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
+        print(f"GroundingDINO loaded: {load_res}")
+        model.eval()
+        return model.to(device)
 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def transform_image(self, image_pil):
+        transform = T.Compose([
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        image, _ = transform(image_pil, None)
+        return image
 
-        def load_model_hf(device='cpu'):
-            args = SLConfig.fromfile(cache_config_file)
-            args.device = device
-            model = build_model(args)
-            checkpoint = torch.load(cache_file, map_location=device)
-            log = model.load_state_dict(clean_state_dict(checkpoint['model']), strict=False)
-            print("Model loaded from {} \n => {}".format(cache_file, log))
-            _ = model.eval()
-            return model
+    def get_grounding_output(self, model, image, caption, box_threshold, text_threshold, device="cuda"):
+        caption = caption.lower()
+        caption = caption.strip()
+        if not caption.endswith("."):
+            caption = caption + "."
+            
+        model = model.to(device)
+        image = image.to(device)
+        
+        with torch.no_grad():
+            outputs = model(image[None], captions=[caption])
+            
+        logits = outputs["pred_logits"].cpu().sigmoid()[0]  # (nq, 256)
+        boxes = outputs["pred_boxes"].cpu()[0]  # (nq, 4)
+        
+        # filter output
+        logits_filt = logits.clone()
+        boxes_filt = boxes.clone()
+        filt_mask = logits_filt.max(dim=1)[0] > box_threshold
+        logits_filt = logits_filt[filt_mask]
+        boxes_filt = boxes_filt[filt_mask]
+        
+        # get phrase
+        tokenlizer = model.tokenizer
+        tokenized = tokenlizer(caption)
+        
+        pred_phrases = []
+        for logit, box in zip(logits_filt, boxes_filt):
+            pred_phrase = get_phrases_from_posmap(logit > text_threshold, tokenized, tokenlizer)
+            pred_phrases.append(pred_phrase + f"({str(logit.max().item())[:4]})")
+            
+        return boxes_filt, pred_phrases
 
-        self.groundingdino_model = load_model_hf(device)
-        sam_checkpoint = '/src/weights/sam_vit_h_4b8939.pth'
-        self.sam_predictor = SamPredictor(build_sam(checkpoint=sam_checkpoint).to(device))
+    def adjust_mask(self, mask, adjustment_factor):
+        """
+        Adjust mask by eroding (negative factor) or dilating (positive factor).
+        factor is roughly pixels.
+        """
+        if adjustment_factor == 0:
+            return mask
+            
+        kernel_size = int(abs(adjustment_factor)) * 2 + 1
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        
+        if adjustment_factor > 0:
+            # Dilation
+            adjusted = cv2.dilate(mask_uint8, kernel, iterations=1)
+        else:
+            # Erosion
+            adjusted = cv2.erode(mask_uint8, kernel, iterations=1)
+            
+        return adjusted > 127
 
     @torch.inference_mode()
     def predict(
             self,
-            image: Path = Input(
-                description="Image",
-                default="https://st.mngbcn.com/rcs/pics/static/T5/fotos/outfit/S20/57034757_56-99999999_01.jpg",
+            image: CogPath = Input(
+                description="Image input",
+                default=None,
             ),
             mask_prompt: str = Input(
-                description="Positive mask prompt",
-                default="clothes,shoes",
+                description="Positive mask prompt (what to segment)",
+                default="clothes, shoes",
             ),
             negative_mask_prompt: str = Input(
-                description="Negative mask prompt",
-                default="pants",
+                description="Negative mask prompt (objects to avoid/exclude in detection logic if applicable, primarily used for context logic here)",
+                default=None,
+            ),
+            box_threshold: float = Input(
+                description="Box threshold for Grounding DINO",
+                default=0.3,
+            ),
+            text_threshold: float = Input(
+                description="Text threshold for Grounding DINO",
+                default=0.25,
             ),
             adjustment_factor: int = Input(
-                description="Mask Adjustment Factor (-ve for erosion, +ve for dilation)",
+                description="Mask Adjustment Factor (-ve for erosion, +ve for dilation in pixels)",
                 default=0,
             ),
-    ) -> Iterator[Path]:
+    ) -> Iterator[CogPath]:
         """Run a single prediction on the model"""
+        if image is None:
+            raise ValueError("Please provide an input image.")
+
         predict_id = str(uuid.uuid4())
-
         print(f"Running prediction: {predict_id}...")
+        
+        # Load Image
+        image_pil = Image.open(image).convert("RGB")
+        image_cv = np.array(image_pil)
+        image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
+        
+        # Run Grounding DINO
+        transformed_image = self.transform_image(image_pil)
+        boxes_filt, pred_phrases = self.get_grounding_output(
+            self.grounding_dino_model, 
+            transformed_image, 
+            mask_prompt, 
+            box_threshold, 
+            text_threshold, 
+            device=self.device
+        )
 
-        individual_masks, bounding_boxes = run_grounding_sam(image,
-                                                             mask_prompt,
-                                                             negative_mask_prompt,
-                                                             self.groundingdino_model,
-                                                             self.sam_predictor,
-                                                             adjustment_factor)
-        print("Done!")
+        # Process boxes for SAM
+        H, W, _ = image_cv.shape
+        boxes_xyxy = boxes_filt * torch.Tensor([W, H, W, H])
+        boxes_xyxy[:, :2] -= boxes_xyxy[:, 2:] / 2
+        boxes_xyxy[:, 2:] += boxes_xyxy[:, :2]
 
-        output_dir = "/tmp/" + predict_id
-        os.makedirs(output_dir, exist_ok=True)  # create directory if it doesn't exist
+        boxes_xyxy = boxes_xyxy.cpu()
+        
+        # Run SAM
+        self.sam_predictor.set_image(np.array(image_pil))
+        transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_xyxy.to(self.device), (H, W))
+        
+        masks, _, _ = self.sam_predictor.predict_torch(
+            point_coords=None,
+            point_labels=None,
+            boxes=transformed_boxes,
+            multimask_output=False,
+        )
+        
+        # Output directory
+        output_dir = f"/tmp/{predict_id}"
+        os.makedirs(output_dir, exist_ok=True)
 
-        # Save JSON file with bounding boxes
-        json_filename = output_dir + "/bounding_boxes.json"
-        with open(json_filename, 'w') as f:
-            json.dump(bounding_boxes, f, indent=2)
-        yield Path(json_filename)
-
-        # Save individual mask images
-        for idx, mask_img in enumerate(individual_masks):
-            mask_filename = output_dir + f"/mask_{idx}_{bounding_boxes[idx]['label']}.png"
+        bounding_boxes_output = []
+        
+        # Save results
+        for idx, (mask, box, phrase) in enumerate(zip(masks, boxes_xyxy, pred_phrases)):
+            # Convert mask to numpy (H, W)
+            mask_np = mask[0].cpu().numpy()
+            
+            # Adjustment (Erosion/Dilation)
+            if adjustment_factor != 0:
+                mask_np = self.adjust_mask(mask_np, adjustment_factor)
+            
+            # Save Mask Image
+            label_clean = phrase.split('(')[0].strip().replace(' ', '_')
+            mask_filename = f"{output_dir}/mask_{idx}_{label_clean}.png"
+            
+            # Create a black and white mask image
+            mask_img = Image.fromarray((mask_np * 255).astype(np.uint8))
             mask_img.save(mask_filename)
-            yield Path(mask_filename)
+            yield CogPath(mask_filename)
+            
+            # Collect Box Info
+            bounding_boxes_output.append({
+                "id": idx,
+                "label": phrase,
+                "box": box.tolist(), # [x1, y1, x2, y2]
+                "mask_file": os.path.basename(mask_filename)
+            })
+
+        # Save JSON
+        json_filename = f"{output_dir}/bounding_boxes.json"
+        with open(json_filename, 'w') as f:
+            json.dump(bounding_boxes_output, f, indent=2)
+        yield CogPath(json_filename)
+
+        print("Done!")
