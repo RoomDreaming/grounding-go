@@ -1,43 +1,25 @@
 build:
   gpu: true
-  cuda: "11.8"
-  python_version: "3.10"
+  cuda: "12.1"
+  python_version: "3.11"
   system_packages:
     - "libgl1-mesa-glx"
     - "libglib2.0-0"
   python_packages:
+    - "torch==2.1.2"
+    - "torchvision==0.16.2"
+    - "transformers==4.45.0"  # Upgraded from 4.39.0 to support Grounding DINO
+    - "accelerate==0.28.0"
+    - "pillow"
+    - "numpy<2"               # Pinned to <2 to fix torch 2.1 compatibility
     - "opencv-python"
-    - "pycocotools"
-    - "matplotlib"
-    - "onnxruntime"
-    - "onnx"
     - "scipy"
-    - "numpy"
-    - "torch==2.0.1"
-    - "torchvision==0.15.2"
-    - "transformers"
-    - "addict"
-    - "yapf"
-    - "timm"
-    - "supervision"
-
+    - "safetensors"
+  
   run:
-    # 安裝 Segment Anything
-    - pip install git+https://github.com/facebookresearch/segment-anything.git
-    
-    # 安裝 GroundingDINO
-    - pip install git+https://github.com/IDEA-Research/GroundingDINO.git
-    
-    # 建立權重目錄
-    - mkdir -p weights
-    
-    # 下載 GroundingDINO Config (Swin-T)
-    - wget -O weights/GroundingDINO_SwinT_OGC.py https://raw.githubusercontent.com/IDEA-Research/GroundingDINO/main/groundingdino/config/GroundingDINO_SwinT_OGC.py
-    
-    # 下載 GroundingDINO 權重
-    - wget -O weights/groundingdino_swint_ogc.pth https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
-    
-    # 下載 SAM 權重 (ViT-H)
-    - wget -O weights/sam_vit_h_4b8939.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
+    - "python3 -m pip install --upgrade pip"
+    # (Keep the rest of your run commands the same)
+    - "curl -o /tmp/download_weights.py https://raw.githubusercontent.com/RoomDreaming/grounding-go/main/download_weights.py || true"
+    - "python3 -c \"import torch; from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, AutoModelForMaskGeneration; AutoProcessor.from_pretrained('IDEA-Research/grounding-dino-base'); AutoModelForZeroShotObjectDetection.from_pretrained('IDEA-Research/grounding-dino-base'); AutoProcessor.from_pretrained('facebook/sam-vit-base'); AutoModelForMaskGeneration.from_pretrained('facebook/sam-vit-base'); print('Weights downloaded successfully!')\""
 
 predict: "predict.py:Predictor"
